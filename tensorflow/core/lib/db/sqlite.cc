@@ -18,16 +18,36 @@ limitations under the License.
 #include "tensorflow/core/platform/logging.h"
 
 namespace tensorflow {
-namespace db {
+namespace {
+
+void ExecuteOrLog(Sqlite* db, const char* sql) {
+  Status s = db->Prepare(sql).StepAndReset();
+  if (!s.ok()) {
+    LOG(WARNING) << s.ToString();
+  }
+}
+
+string ExecuteOrEmpty(Sqlite* db, const char* sql) {
+  auto stmt = db->Prepare(sql);
+  bool is_done = false;
+  if (stmt.Step(&is_done).ok() && !is_done) {
+    return stmt.ColumnString(0);
+  }
+  return "";
+}
+
+}  // namespace
 
 /* static */
-Status Sqlite::Open(const string& uri, std::unique_ptr<Sqlite>* db) {
+xla::StatusOr<std::shared_ptr<Sqlite>> Sqlite::Open(const string& uri) {
   sqlite3* sqlite = nullptr;
-  Status s = MakeStatus(sqlite3_open(uri.c_str(), &sqlite));
-  if (s.ok()) {
-    *db = std::unique_ptr<Sqlite>(new Sqlite(sqlite));
-  }
-  return s;
+  TF_RETURN_IF_ERROR(MakeStatus(sqlite3_open(uri.c_str(), &sqlite)));
+  Sqlite* db = new Sqlite(sqlite, uri);
+  // This is the SQLite default since 2016. However it's good to set
+  // this anyway, since we might get linked against an older version of
+  // the library, and it's pretty much impossible to change later.
+  ExecuteOrLog(db, "PRAGMA page_size=4096");
+  return std::shared_ptr<Sqlite>(db);
 }
 
 /* static */ Status Sqlite::MakeStatus(int resultCode) {
@@ -76,7 +96,7 @@ Status Sqlite::Open(const string& uri, std::unique_ptr<Sqlite>* db) {
   }
 }
 
-Sqlite::Sqlite(sqlite3* db) : db_(db) {}
+Sqlite::Sqlite(sqlite3* db, const string& uri) : db_(db), uri_(uri) {}
 
 Sqlite::~Sqlite() {
   // close_v2 doesn't care if a stmt hasn't been GC'd yet
@@ -87,6 +107,9 @@ Sqlite::~Sqlite() {
 }
 
 Status Sqlite::Close() {
+  if (db_ == nullptr) {
+    return Status::OK();
+  }
   // If Close is explicitly called, ordering must be correct.
   Status s = MakeStatus(sqlite3_close(db_));
   if (s.ok()) {
@@ -95,23 +118,66 @@ Status Sqlite::Close() {
   return s;
 }
 
-std::unique_ptr<SqliteStatement> Sqlite::Prepare(const string& sql) {
-  sqlite3_stmt* stmt = nullptr;
-  int rc = sqlite3_prepare_v2(db_, sql.c_str(), sql.size() + 1, &stmt, nullptr);
-  return std::unique_ptr<SqliteStatement>(new SqliteStatement(stmt, rc));
+void Sqlite::UseWriteAheadLogWithReducedDurabilityIfPossible() {
+  // TensorFlow summaries are intensively write-heavy, cf. most apps.
+  // This pragma loves writes and means that TensorBoard can read the
+  // database even as the training job inserts stuff. In other words,
+  // this makes SQLite almost as powerful as MySQL or PostgreSQL.
+  // https://www.sqlite.org/wal.html
+  string journal = ExecuteOrEmpty(this, "PRAGMA journal_mode=wal");
+  if (journal != "wal") {
+    LOG(WARNING) << "Failed to set journal_mode=wal because SQLite wants "
+                 << uri_ << " to be in '" << journal << "' mode, which might "
+                 << "be bad since WAL is important for the performance of "
+                 << "write-intensive apps. This might only happen for memory "
+                 << "databases or old versions of SQLite, but is definitely "
+                 << "worth fixing if that's not the case";
+  } else {
+    // This setting means we might lose transactions due to power loss,
+    // but the database can't become corrupted. In exchange, we get the
+    // the performance of a NoSQL database. This is a trade-off most data
+    // scientists would consider acceptable.
+    // https://www.sqlite.org/pragma.html#pragma_synchronous
+    ExecuteOrLog(this, "PRAGMA synchronous=NORMAL");
+  }
 }
 
-SqliteStatement::SqliteStatement(sqlite3_stmt* stmt, int error)
-    : stmt_(stmt), error_(error) {}
+SqliteStatement Sqlite::Prepare(const string& sql) {
+  sqlite3_stmt* stmt = nullptr;
+  int rc = sqlite3_prepare_v2(db_, sql.c_str(), sql.size() + 1, &stmt, nullptr);
+  if (rc == SQLITE_OK) {
+    return {stmt, SQLITE_OK, std::unique_ptr<string>(nullptr)};
+  } else {
+    return {nullptr, rc, std::unique_ptr<string>(new string(sql))};
+  }
+}
 
-SqliteStatement::~SqliteStatement() {
-  int rc = sqlite3_finalize(stmt_);
-  if (rc != SQLITE_OK) {
-    LOG(ERROR) << "destruct sqlite3_stmt: " << Sqlite::MakeStatus(rc);
+Status SqliteStatement::status() const {
+  Status s = Sqlite::MakeStatus(error_);
+  if (!s.ok()) {
+    if (stmt_ != nullptr) {
+      errors::AppendToMessage(&s, sqlite3_sql(stmt_));
+    } else {
+      errors::AppendToMessage(&s, *prepare_error_sql_);
+    }
+  }
+  return s;
+}
+
+void SqliteStatement::CloseOrLog() {
+  if (stmt_ != nullptr) {
+    int rc = sqlite3_finalize(stmt_);
+    if (rc != SQLITE_OK) {
+      LOG(ERROR) << "destruct sqlite3_stmt: " << Sqlite::MakeStatus(rc);
+    }
+    stmt_ = nullptr;
   }
 }
 
 Status SqliteStatement::Close() {
+  if (stmt_ == nullptr) {
+    return Status::OK();
+  }
   int rc = sqlite3_finalize(stmt_);
   if (rc == SQLITE_OK) {
     stmt_ = nullptr;
@@ -121,8 +187,10 @@ Status SqliteStatement::Close() {
 }
 
 void SqliteStatement::Reset() {
-  sqlite3_reset(stmt_);
-  sqlite3_clear_bindings(stmt_);
+  if (TF_PREDICT_TRUE(stmt_ != nullptr)) {
+    sqlite3_reset(stmt_);
+    sqlite3_clear_bindings(stmt_);  // not nullptr friendly
+  }
   error_ = SQLITE_OK;
 }
 
@@ -163,5 +231,4 @@ Status SqliteStatement::StepAndReset() {
   return s;
 }
 
-}  // namespace db
 }  // namespace tensorflow

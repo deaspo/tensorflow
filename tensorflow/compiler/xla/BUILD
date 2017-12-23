@@ -7,7 +7,6 @@ package_group(
     packages = [
         "//tensorflow/compiler/...",
         "//tensorflow/contrib/tpu/...",
-        "//tensorflow/contrib/xla_tf_graph/...",
     ],
 )
 
@@ -21,6 +20,10 @@ package_group(
 load("//tensorflow:tensorflow.bzl", "cc_header_only_library")
 load("//tensorflow:tensorflow.bzl", "tf_cc_test")
 load("//tensorflow/compiler/xla:xla.bzl", "xla_proto_library")
+load(
+    "//tensorflow/core:platform/default/build_config.bzl",
+    "tf_proto_library_py",
+)
 
 # Filegroup used to collect source files for dependency checking.
 filegroup(
@@ -33,6 +36,12 @@ filegroup(
 
 xla_proto_library(
     name = "xla_data_proto",
+    srcs = ["xla_data.proto"],
+    visibility = ["//visibility:public"],
+)
+
+tf_proto_library_py(
+    name = "xla_data_proto",  # bzl adds a _py suffix
     srcs = ["xla_data.proto"],
     visibility = ["//visibility:public"],
 )
@@ -78,6 +87,7 @@ cc_library(
     hdrs = ["types.h"],
     visibility = [":friends"],
     deps = [
+        "//tensorflow/core:framework_lite",
         "//tensorflow/core:lib",
         "//third_party/eigen3",
     ],
@@ -175,6 +185,7 @@ cc_library(
         ":types",
         ":xla_data_proto",
         "//tensorflow/core:lib",
+        "//tensorflow/core:ptr_util",
     ],
 )
 
@@ -340,8 +351,8 @@ cc_library(
     name = "array",
     hdrs = ["array.h"],
     deps = [
+        ":status",
         ":types",
-        ":util",
         "//tensorflow/core:lib",
     ],
 )

@@ -18,6 +18,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import collections
 import contextlib
 import copy
 import random
@@ -42,6 +43,10 @@ _device_parsing_cache = {}
 
 _MAXINT32 = 2**31 - 1
 
+DEVICE_PLACEMENT_EXPLICIT = pywrap_tensorflow.TFE_DEVICE_PLACEMENT_EXPLICIT
+DEVICE_PLACEMENT_WARN = pywrap_tensorflow.TFE_DEVICE_PLACEMENT_WARN
+DEVICE_PLACEMENT_SILENT = pywrap_tensorflow.TFE_DEVICE_PLACEMENT_SILENT
+
 
 # TODO(agarwal): better name ?
 class _EagerContext(threading.local):
@@ -54,7 +59,43 @@ class _EagerContext(threading.local):
     self.mode = _default_mode
     self.scope_name = ""
     self.recording_summaries = False
+    self.summary_writer_resource = None
     self.scalar_cache = {}
+
+
+ContextStackEntry = collections.namedtuple(
+    "ContextStackEntry", ["is_building_function", "enter_context_fn"])
+
+
+class ContextStack(threading.local):
+  """A thread-local stack of context switches."""
+
+  def __init__(self):
+    super(ContextStack, self).__init__()
+    self.stack = []
+
+  def push(self, is_building_function, enter_context_fn):
+    """Push metadata about a context switch onto the stack.
+
+    A context switch can take one of two forms: installing a graph as the
+    default graph, or entering the eager context.
+
+    Args:
+      is_building_function: (bool.) Whether the context is building a function.
+      enter_context_fn: (function.) A callable that executes the context switch.
+        For example, `graph.as_default` or `eager_mode`.
+    """
+
+    self.stack.append(
+        ContextStackEntry(is_building_function, enter_context_fn))
+
+  def pop(self):
+    """Pop the stack."""
+
+    self.stack.pop()
+
+
+context_stack = ContextStack()
 
 
 # TODO(agarwal): rename to EagerContext / EagerRuntime ?
@@ -62,22 +103,31 @@ class _EagerContext(threading.local):
 class Context(object):
   """Environment in which eager operations execute."""
 
-  def __init__(self, config=None):
+  def __init__(self, config=None, device_policy=None):
     """Creates a new Context.
 
     Args:
       config: (Optional.) A `ConfigProto` protocol buffer with configuration
-      options for the Context. Note that a lot of these options may be
-      currently unimplemented or irrelevant for EAGER mode.
+       options for the Context. Note that a lot of these options may be
+       currently unimplemented or irrelevant when eager execution is enabled.
+      device_policy: (Optional.) What policy to use when trying to run an
+       operation on a device with inputs which are not on that device.
+       Valid values:
+         tfe.DEVICE_PLACEMENT_EXPLICIT: raises an error if the placement is not
+           correct.
+         tfe.DEVICE_PLACEMENT_WARN: copies the tensors which are not on the
+           right device but raises a warning.
+         tfe.DEVICE_PLACEMENT_SILENT: silently copies the tensors. This might
+           hide performance problems.
     """
     self._eager_context = _EagerContext()
     self._context_handle = None
     self._context_devices = None
-    self._summary_writer_resource = None
     self._post_execution_callbacks = []
     self._config = config
     self._seed = None
     self._initialize_lock = threading.Lock()
+    self._device_policy = device_policy
 
   def _set_global_seed(self, seed):
     """Set a global eager mode seed for random ops."""
@@ -109,6 +159,9 @@ class Context(object):
             config_str = self._config.SerializeToString()
             pywrap_tensorflow.TFE_ContextOptionsSetConfig(
                 opts, config_str, len(config_str), status)
+          if self._device_policy is not None:
+            pywrap_tensorflow.TFE_ContextOptionsSetDevicePlacementPolicy(
+                opts, self._device_policy)
           self._context_handle = pywrap_tensorflow.TFE_NewContext(opts, status)
       finally:
         pywrap_tensorflow.TFE_DeleteContextOptions(opts)
@@ -166,10 +219,14 @@ class Context(object):
     ctx = self._eager_context
     old_mode = ctx.mode
     ctx.mode = mode
+    if mode == EAGER_MODE:
+      context_stack.push(False, eager_mode)
     try:
       yield
     finally:
       ctx.mode = old_mode
+      if mode == EAGER_MODE:
+        context_stack.pop()
 
   def in_graph_mode(self):
     """Returns True if current thread is in GRAPH mode."""
@@ -196,12 +253,12 @@ class Context(object):
   @property
   def summary_writer_resource(self):
     """Returns summary writer resource."""
-    return self._summary_writer_resource
+    return self._eager_context.summary_writer_resource
 
   @summary_writer_resource.setter
   def summary_writer_resource(self, resource):
     """Sets summary writer resource."""
-    self._summary_writer_resource = resource
+    self._eager_context.summary_writer_resource = resource
 
   @property
   def device_name(self):
@@ -270,6 +327,21 @@ class Context(object):
     """The number of GPUs available to execute operations."""
     self._initialize_handle_and_devices()
     return self._num_gpus
+
+  def add_function(self, fn):
+    """Add a function definition to the context.
+
+    Once added, the function (identified by its name) can be executed like any
+    other operation.
+
+    Args:
+      fn: A wrapped TF_Function (returned from TF_GraphToFunction_wrapper).
+    """
+    with errors.raise_exception_on_not_ok_status() as status:
+      pywrap_tensorflow.TFE_ContextAddFunction(
+          self._handle,  # pylint: disable=protected-access
+          fn,
+          status)
 
   def add_function_def(self, fdef):
     """Add a function definition to the context.
